@@ -88,6 +88,9 @@ internal sealed class GainMeter : ISampleProvider
     public volatile float Gain = 1f;
     public volatile bool Muted;
 
+    /// <summary>When set, the peak is measured before gain and mute (an input meter).</summary>
+    public bool MeterInput { get; init; }
+
     /// <summary>Peak since the last call, 0..1.</summary>
     public float TakePeak()
     {
@@ -103,9 +106,10 @@ internal sealed class GainMeter : ISampleProvider
         float peak = _peak;
         for (int i = offset; i < offset + read; i++)
         {
-            float s = buffer[i] * gain;
+            float raw = buffer[i];
+            float s = raw * gain;
             buffer[i] = s;
-            float a = Math.Abs(s);
+            float a = Math.Abs(MeterInput ? raw : s);
             if (a > peak) peak = a;
         }
         _peak = peak;
@@ -113,21 +117,49 @@ internal sealed class GainMeter : ISampleProvider
     }
 }
 
-/// <summary>Runs mono audio through the current voice preset. The preset can be swapped while playing.</summary>
+/// <summary>
+/// Always returns exactly what was asked for, padding with silence. The mixer
+/// drops any input that comes up short, which would silently kill the mic.
+/// </summary>
+internal sealed class KeepAlive : ISampleProvider
+{
+    private readonly ISampleProvider _source;
+
+    public KeepAlive(ISampleProvider source) => _source = source;
+
+    public WaveFormat WaveFormat => _source.WaveFormat;
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        int read = 0;
+        try
+        {
+            read = _source.Read(buffer, offset, count);
+        }
+        catch
+        {
+            // Never let one bad buffer take the whole output down.
+        }
+        if (read < count) Array.Clear(buffer, offset + read, count - read);
+        return count;
+    }
+}
+
+/// <summary>Runs mono audio through the current voice settings, which can be swapped while playing.</summary>
 internal sealed class VoiceEffectProvider : ISampleProvider
 {
     private readonly ISampleProvider _source;
     private volatile VoiceChain _chain;
 
-    public VoiceEffectProvider(ISampleProvider source, VoicePreset preset)
+    public VoiceEffectProvider(ISampleProvider source, VoiceSettings settings)
     {
         _source = source;
-        _chain = new VoiceChain(preset, source.WaveFormat.SampleRate);
+        _chain = new VoiceChain(settings, source.WaveFormat.SampleRate);
     }
 
     public WaveFormat WaveFormat => _source.WaveFormat;
 
-    public void SetPreset(VoicePreset preset) => _chain = new VoiceChain(preset, WaveFormat.SampleRate);
+    public void SetSettings(VoiceSettings settings) => _chain = new VoiceChain(settings, WaveFormat.SampleRate);
 
     public int Read(float[] buffer, int offset, int count)
     {
@@ -148,7 +180,7 @@ internal sealed class Tee : ISampleProvider
     public Tee(ISampleProvider source)
     {
         _source = source;
-        Copy = new FloatRingBuffer(source.WaveFormat, source.WaveFormat.SampleRate / 5);
+        Copy = new FloatRingBuffer(source.WaveFormat, source.WaveFormat.SampleRate / 5) { MaxLatency = source.WaveFormat.SampleRate * 30 / 1000 };
     }
 
     public WaveFormat WaveFormat => _source.WaveFormat;
@@ -178,6 +210,14 @@ internal sealed class FloatRingBuffer : ISampleProvider
 
     public WaveFormat WaveFormat { get; }
 
+    public void Clear()
+    {
+        lock (_lock) { _read = 0; _count = 0; }
+    }
+
+    /// <summary>When more than this many samples are waiting, skip ahead so the delay stays short.</summary>
+    public int MaxLatency { get; init; } = int.MaxValue;
+
     public void Write(float[] src, int offset, int count)
     {
         lock (_lock)
@@ -196,6 +236,12 @@ internal sealed class FloatRingBuffer : ISampleProvider
     {
         lock (_lock)
         {
+            if (_count > MaxLatency + count)
+            {
+                int skip = _count - MaxLatency;
+                _read = (_read + skip) % _data.Length;
+                _count -= skip;
+            }
             int n = Math.Min(count, _count);
             for (int i = 0; i < n; i++)
             {

@@ -15,7 +15,6 @@ public sealed class ProcessLoopbackCapture : IDisposable
     private const ushort VT_BLOB = 65;
 
     private readonly int _processId;
-    private AudioClient? _client;
     private Thread? _thread;
     private volatile bool _stopping;
 
@@ -31,20 +30,30 @@ public sealed class ProcessLoopbackCapture : IDisposable
 
     public void Start()
     {
-        // Activation has to happen off the UI (STA) thread or the callback never arrives.
-        var iface = Task.Run(() => ActivateAsync(_processId)).GetAwaiter().GetResult();
-        _client = new AudioClient(iface);
-        _client.Initialize(
-            AudioClientShareMode.Shared,
-            AudioClientStreamFlags.Loopback | AudioClientStreamFlags.EventCallback | AudioClientStreamFlags.AutoConvertPcm,
-            200_000, // 20 ms in 100ns units
-            0,
-            WaveFormat,
-            Guid.Empty);
-
+        // The activated audio client can't be handed between COM apartments, so one
+        // background (MTA) thread activates it, sets it up and runs the capture loop.
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _stopping = false;
-        _thread = new Thread(CaptureLoop) { IsBackground = true, Name = "App capture", Priority = ThreadPriority.AboveNormal };
+        _thread = new Thread(() => CaptureLoop(started)) { IsBackground = true, Name = "App capture", Priority = ThreadPriority.AboveNormal };
+        _thread.SetApartmentState(ApartmentState.MTA);
         _thread.Start();
+
+        bool answered;
+        try
+        {
+            answered = started.Task.Wait(TimeSpan.FromSeconds(5));
+        }
+        catch (AggregateException ex)
+        {
+            _thread = null;
+            throw ex.InnerException!;
+        }
+
+        if (!answered)
+        {
+            Stop();
+            throw new TimeoutException("Windows didn't answer the app capture request.");
+        }
     }
 
     public void Stop()
@@ -54,9 +63,27 @@ public sealed class ProcessLoopbackCapture : IDisposable
         _thread = null;
     }
 
-    private void CaptureLoop()
+    private void CaptureLoop(TaskCompletionSource started)
     {
-        var client = _client!;
+        AudioClient client;
+        try
+        {
+            var iface = ActivateAsync(_processId).GetAwaiter().GetResult();
+            client = new AudioClient(iface);
+            client.Initialize(
+                AudioClientShareMode.Shared,
+                AudioClientStreamFlags.Loopback | AudioClientStreamFlags.EventCallback | AudioClientStreamFlags.AutoConvertPcm,
+                200_000, // 20 ms in 100ns units
+                0,
+                WaveFormat,
+                Guid.Empty);
+        }
+        catch (Exception ex)
+        {
+            started.TrySetException(ex);
+            return;
+        }
+
         using var ready = new AutoResetEvent(false);
         try
         {
@@ -65,6 +92,7 @@ public sealed class ProcessLoopbackCapture : IDisposable
             int blockAlign = WaveFormat.BlockAlign;
             var buffer = new byte[WaveFormat.AverageBytesPerSecond / 10];
             client.Start();
+            started.TrySetResult();
 
             while (!_stopping)
             {
@@ -91,7 +119,11 @@ public sealed class ProcessLoopbackCapture : IDisposable
         }
         catch (Exception ex)
         {
-            Failed?.Invoke(this, ex);
+            if (!started.TrySetException(ex)) Failed?.Invoke(this, ex);
+        }
+        finally
+        {
+            client.Dispose();
         }
     }
 
@@ -128,8 +160,6 @@ public sealed class ProcessLoopbackCapture : IDisposable
     public void Dispose()
     {
         Stop();
-        _client?.Dispose();
-        _client = null;
     }
 
     [DllImport("Mmdevapi.dll", ExactSpelling = true, PreserveSig = false)]

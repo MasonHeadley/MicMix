@@ -1,250 +1,415 @@
+using System.Reflection;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using MicMix.Audio;
+using MicMix.Audio.Ai;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
 using NAudio.CoreAudioApi;
 
 namespace MicMix;
 
+/// <summary>
+/// Hosts the HTML interface and connects it to the audio engine. The page sends
+/// small JSON messages for every control change; nothing here needs a restart
+/// except picking a different mic or output device, which restarts quietly.
+/// </summary>
 public sealed class MainForm : Form
 {
-    private static readonly AppItem NoApp = new(0, "Nothing (mic only)", null);
+    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+
+    /// <summary>Shown as 0.4.01: the last part is the build count between releases.</summary>
+    public static readonly string Version = FormatVersion(Assembly.GetExecutingAssembly().GetName().Version);
 
     private readonly AudioEngine _engine = new();
     private readonly Settings _settings = Settings.Load();
-
-    private readonly ComboBox _mic = Combo();
-    private readonly CheckBox _micMute = new() { Text = "Mute", AutoSize = true };
-    private readonly TrackBar _micVolume = Slider();
-    private readonly ProgressBar _micMeter = Meter();
-    private readonly ComboBox _preset = Combo();
-    private readonly ComboBox _app = Combo();
-    private readonly Button _refresh = new() { Text = "Refresh", AutoSize = true };
-    private readonly CheckBox _appMute = new() { Text = "Mute", AutoSize = true };
-    private readonly TrackBar _appVolume = Slider();
-    private readonly ProgressBar _appMeter = Meter();
-    private readonly ComboBox _output = Combo();
-    private readonly CheckBox _monitor = new() { Text = "Hear myself on", AutoSize = true, Anchor = AnchorStyles.Left };
-    private readonly ComboBox _monitorDevice = Combo();
-    private readonly Button _start = new() { Text = "Start", Width = 120, Height = 34 };
-    private readonly Label _status = new() { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = SystemColors.GrayText };
-    private readonly Label _hint = new() { AutoSize = true, MaximumSize = new Size(520, 0), ForeColor = SystemColors.GrayText };
-    private readonly System.Windows.Forms.Timer _meterTimer = new() { Interval = 50 };
+    private readonly WebView2 _web = new() { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(10, 10, 16) };
+    private readonly System.Windows.Forms.Timer _meterTimer = new() { Interval = 60 };
+    private List<AppItem> _apps = new();
+    private bool _ready;
+    private bool _dirty;
+    private int _ticks;
 
     public MainForm()
     {
-        Text = "MicMix";
-        FormBorderStyle = FormBorderStyle.FixedSingle;
-        MaximizeBox = false;
-        AutoSize = true;
-        AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        Padding = new Padding(12);
-        Font = new Font("Segoe UI", 9.5f);
+        Text = "MicMix v" + Version;
+        BackColor = Color.FromArgb(10, 10, 16);
+        MinimumSize = new Size(660, 460);
+        Size = new Size(1180, 800);
         StartPosition = FormStartPosition.CenterScreen;
+        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+        Controls.Add(_web);
 
-        var grid = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Dock = DockStyle.Fill };
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 320));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-
-        AddRow(grid, "Microphone", _mic, _micMute);
-        AddRow(grid, "Mic volume", _micVolume, _micMeter);
-        AddRow(grid, "Voice effect", _preset, null);
-        AddRow(grid, "Share app audio", _app, _refresh);
-        AddRow(grid, "App volume", _appVolume, Stack(_appMeter, _appMute));
-        AddRow(grid, "Send to", _output, null);
-
-        grid.Controls.Add(_monitor, 0, grid.RowCount);
-        grid.Controls.Add(_monitorDevice, 1, grid.RowCount);
-        grid.RowCount++;
-
-        var startRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 10, 0, 4), WrapContents = false };
-        startRow.Controls.Add(_start);
-        startRow.Controls.Add(_status);
-        grid.Controls.Add(startRow, 0, grid.RowCount);
-        grid.SetColumnSpan(startRow, 3);
-        grid.RowCount++;
-
-        grid.Controls.Add(_hint, 0, grid.RowCount);
-        grid.SetColumnSpan(_hint, 3);
-        grid.RowCount++;
-
-        Controls.Add(grid);
-
-        LoadChoices();
-        WireEvents();
-        UpdateRunningState();
-    }
-
-    private void LoadChoices()
-    {
-        var inputs = DeviceList.Inputs();
-        var outputs = DeviceList.Outputs();
-
-        // Don't offer the cable's own output as a mic, that just loops back on itself.
-        _mic.Items.AddRange(inputs.Where(d => !IsCable(d)).Cast<object>().ToArray());
-        Select(_mic, _settings.MicId ?? DeviceList.DefaultId(DataFlow.Capture));
-
-        _output.Items.AddRange(outputs.Cast<object>().ToArray());
-        string? cable = outputs.FirstOrDefault(IsCable)?.Id;
-        Select(_output, _settings.OutputId ?? cable);
-
-        _monitorDevice.Items.AddRange(outputs.Where(d => !IsCable(d)).Cast<object>().ToArray());
-        Select(_monitorDevice, _settings.MonitorId ?? DeviceList.DefaultId(DataFlow.Render));
-        _monitor.Checked = _settings.MonitorEnabled;
-
-        _preset.Items.AddRange(VoicePreset.All.Cast<object>().ToArray());
-        _preset.SelectedItem = VoicePreset.All.FirstOrDefault(p => p.Name == _settings.Preset) ?? VoicePreset.Off;
-        _engine.Preset = (VoicePreset)_preset.SelectedItem;
-
-        _micVolume.Value = Math.Clamp(_settings.MicVolume, 0, 200);
-        _appVolume.Value = Math.Clamp(_settings.AppVolume, 0, 200);
-        _engine.MicVolume = _micVolume.Value / 100f;
-        _engine.AppVolume = _appVolume.Value / 100f;
-
-        RefreshApps();
-
-        _hint.Text = cable == null
-            ? "No virtual cable found. Install VB-Cable (free, vb-audio.com), restart this app, and pick \"CABLE Input\" under Send to."
-            : "In Discord, Zoom, a game, etc., set your microphone / input device to \"CABLE Output\".";
-    }
-
-    private void RefreshApps()
-    {
-        string? keep = (_app.SelectedItem as AppItem)?.Name ?? _settings.AppName;
-        _app.BeginUpdate();
-        _app.Items.Clear();
-        _app.Items.Add(NoApp);
-        _app.Items.AddRange(DeviceList.Apps().Cast<object>().ToArray());
-        _app.SelectedItem = _app.Items.Cast<AppItem>().FirstOrDefault(a => a.Name == keep) ?? NoApp;
-        _app.EndUpdate();
-    }
-
-    private void WireEvents()
-    {
-        _start.Click += (_, _) => ToggleRunning();
-        _refresh.Click += (_, _) => RefreshApps();
-
-        _micVolume.ValueChanged += (_, _) => _engine.MicVolume = _micVolume.Value / 100f;
-        _appVolume.ValueChanged += (_, _) => _engine.AppVolume = _appVolume.Value / 100f;
-        _micMute.CheckedChanged += (_, _) => _engine.MicMuted = _micMute.Checked;
-        _appMute.CheckedChanged += (_, _) => _engine.AppMuted = _appMute.Checked;
-        _preset.SelectedIndexChanged += (_, _) => { if (_preset.SelectedItem is VoicePreset p) _engine.Preset = p; };
-
-        _app.SelectedIndexChanged += (_, _) =>
-        {
-            if (!_engine.IsRunning) return;
-            try
-            {
-                _engine.SetApp(SelectedAppId());
-                SetStatus("Running");
-            }
-            catch (Exception ex)
-            {
-                SetStatus("Couldn't capture that app: " + ex.Message);
-            }
-        };
-
-        _engine.Problem += (_, msg) => BeginInvoke(() => SetStatus(msg));
+        ApplyMixer();
+        try { AiVoiceLibrary.InstallPacksNextToApp(); } catch { }
+        _engine.AiVoices = AiVoiceLibrary.Voices();
+        _engine.Voice = _settings.Voice;
+        _engine.Problem += (_, msg) => BeginInvoke(() => SendStatus(msg));
+        _engine.AiStatus += (_, msg) => BeginInvoke(() => Post(new { type = "aiStatus", text = msg }));
 
         _meterTimer.Tick += (_, _) =>
         {
-            _micMeter.Value = Decay(_micMeter.Value, _engine.TakeMicPeak());
-            _appMeter.Value = Decay(_appMeter.Value, _engine.TakeAppPeak());
+            if (_ready)
+                Post(new { type = "levels", mic = _engine.TakeMicPeak(), app = _engine.TakeAppPeak() });
+
+            // Save a couple of seconds after the last change rather than on every slider tick.
+            if (_dirty && ++_ticks > 30)
+            {
+                _dirty = false;
+                _ticks = 0;
+                _settings.Save();
+            }
         };
-        _meterTimer.Start();
+
+        Load += async (_, _) => await InitWebAsync();
     }
 
-    private void ToggleRunning()
+    private async Task InitWebAsync()
     {
-        if (_engine.IsRunning)
+        try
         {
-            _engine.Stop();
-            SetStatus("Stopped");
+            string dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MicMix", "WebView2");
+            var env = await CoreWebView2Environment.CreateAsync(null, dataDir);
+            await _web.EnsureCoreWebView2Async(env);
         }
-        else
+        catch (Exception ex)
         {
-            if (_mic.SelectedItem is not DeviceItem mic || _output.SelectedItem is not DeviceItem output)
-            {
-                SetStatus("Pick a microphone and an output first.");
-                return;
-            }
+            MessageBox.Show(this,
+                "MicMix needs the Microsoft Edge WebView2 Runtime, which comes with Windows 11 and most Windows 10 PCs.\n\n" +
+                "Install it from https://go.microsoft.com/fwlink/p/?LinkId=2124703 and start MicMix again.\n\n" + ex.Message,
+                "MicMix", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Close();
+            return;
+        }
 
-            string? monitor = _monitor.Checked ? (_monitorDevice.SelectedItem as DeviceItem)?.Id : null;
-            try
-            {
-                Cursor = Cursors.WaitCursor;
-                _engine.Start(mic.Id, output.Id, monitor, SelectedAppId());
-                SetStatus("Running");
-            }
-            catch (Exception ex)
-            {
-                SetStatus("Couldn't start: " + ex.Message);
-            }
-            finally
-            {
-                Cursor = Cursors.Default;
-            }
-        }
-        UpdateRunningState();
+        var core = _web.CoreWebView2;
+        core.Settings.AreDevToolsEnabled = false;
+        core.Settings.AreDefaultContextMenusEnabled = false;
+        core.Settings.IsStatusBarEnabled = false;
+        core.Settings.IsZoomControlEnabled = false;
+        core.WebMessageReceived += (_, e) => OnMessage(e.WebMessageAsJson);
+        core.NavigateToString(LoadPage());
     }
 
-    private int? SelectedAppId() => _app.SelectedItem is AppItem a && a.ProcessId != 0 ? a.ProcessId : null;
-
-    private void UpdateRunningState()
+    private static string LoadPage()
     {
-        bool running = _engine.IsRunning;
-        _start.Text = running ? "Stop" : "Start";
-        _mic.Enabled = _output.Enabled = _monitor.Enabled = _monitorDevice.Enabled = !running;
+        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("MicMix.UI.index.html")!;
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
     }
 
-    private void SetStatus(string text) => _status.Text = text;
+    private void OnMessage(string json)
+    {
+        JsonNode? msg;
+        try { msg = JsonNode.Parse(json); }
+        catch { return; }
+        if (msg == null) return;
+        _dirty = true;
+        _ticks = 0;
+
+        try
+        {
+            switch ((string?)msg["type"])
+            {
+                case "ready":
+                    _ready = true;
+                    SendInit();
+                    _meterTimer.Start();
+                    AutoStart();
+                    break;
+
+                case "power":
+                    if ((bool?)msg["on"] == true) StartEngine();
+                    else { _engine.Stop(); SendStatus("Stopped"); }
+                    break;
+
+                case "voice":
+                    _settings.Voice = msg["voice"]!.Deserialize<VoiceSettings>(Json) ?? VoiceSettings.Neutral;
+                    _settings.ActivePreset = (string?)msg["preset"] ?? "";
+                    _engine.Voice = _settings.Voice;
+                    break;
+
+                case "mixer":
+                    SetMixer((string)msg["key"]!, msg["value"]!);
+                    break;
+
+                case "app":
+                    SelectApp((int?)msg["pid"]);
+                    break;
+
+                case "refreshApps":
+                    SendApps();
+                    break;
+
+                case "devices":
+                    _settings.MicId = (string?)msg["mic"];
+                    _settings.OutputId = (string?)msg["output"];
+                    _settings.MirrorId = (string?)msg["mirror"];
+                    if (_engine.IsRunning && (_engine.MicId != _settings.MicId || _engine.OutputId != _settings.OutputId))
+                        StartEngine();
+                    else
+                        UpdateMirror();
+                    break;
+
+                case "theme":
+                    _settings.Theme = (string?)msg["theme"] ?? "cyber";
+                    break;
+
+                case "saveProfile":
+                {
+                    string name = ((string?)msg["name"] ?? "").Trim();
+                    if (name.Length == 0) break;
+                    var voice = msg["voice"]!.Deserialize<VoiceSettings>(Json) ?? VoiceSettings.Neutral;
+                    _settings.Profiles.RemoveAll(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
+                    _settings.Profiles.Add(new VoiceProfile { Name = name, Voice = voice });
+                    _settings.ActivePreset = name;
+                    _settings.Save();
+                    SendProfiles();
+                    break;
+                }
+
+                case "installAiPack":
+                    InstallAiPack();
+                    break;
+
+                case "openUrl":
+                {
+                    // Only our own links, opened in the normal browser.
+                    string url = (string?)msg["url"] ?? "";
+                    bool ours = url.StartsWith("https://github.com/MasonHeadley/", StringComparison.OrdinalIgnoreCase);
+                    bool credit = _engine.AiVoices.Any(v => v.Link == url) || CreditLinks.Contains(url);
+                    if (ours || credit)
+                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
+                    break;
+                }
+
+                case "deleteProfile":
+                {
+                    string name = (string?)msg["name"] ?? "";
+                    _settings.Profiles.RemoveAll(p => p.Name == name);
+                    _settings.Save();
+                    SendProfiles();
+                    break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            SendStatus(ex.Message);
+        }
+    }
+
+    private void InstallAiPack()
+    {
+        using var dialog = new OpenFileDialog { Title = "Pick an AI voice pack", Filter = "AI voice pack (*.zip)|*.zip" };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        try
+        {
+            Cursor = Cursors.WaitCursor;
+            int n = AiVoiceLibrary.Install(dialog.FileName);
+            _engine.AiVoices = AiVoiceLibrary.Voices();
+            SendAiVoices();
+            SendStatus(n == 1 ? "Installed 1 AI voice" : $"Installed {n} AI voices");
+        }
+        catch (Exception ex)
+        {
+            SendStatus("Couldn't install that pack: " + ex.Message);
+        }
+        finally
+        {
+            Cursor = Cursors.Default;
+        }
+    }
+
+    private object AiVoiceList() => new
+    {
+        ready = AiVoiceLibrary.HasSharedModels,
+        voices = _engine.AiVoices.Select(v => new { id = v.Id, name = v.Name, credit = v.Credit, link = v.Link, key = v.Key }),
+    };
+
+    private void SendAiVoices() => Post(new { type = "aiVoices", ai = AiVoiceList() });
+
+    private void AutoStart()
+    {
+        if (_settings.MicId != null && _settings.OutputId != null) StartEngine();
+        else SendStatus("Pick your devices in Settings, then press Power.");
+    }
+
+    private void StartEngine()
+    {
+        var inputs = DeviceList.Inputs();
+        var outputs = DeviceList.Outputs();
+        string? mic = inputs.FirstOrDefault(d => d.Id == _settings.MicId)?.Id ?? inputs.FirstOrDefault(d => !IsCable(d))?.Id;
+        string? output = outputs.FirstOrDefault(d => d.Id == _settings.OutputId)?.Id ?? outputs.FirstOrDefault(IsCable)?.Id;
+
+        if (mic == null || output == null)
+        {
+            SendStatus(output == null ? "No virtual cable found. Install VB-Cable and restart MicMix." : "No microphone found.");
+            return;
+        }
+
+        try
+        {
+            Cursor = Cursors.WaitCursor;
+            _engine.Start(mic, output);
+            UpdateMirror();
+            SendStatus("Live");
+        }
+        catch (Exception ex)
+        {
+            SendStatus("Couldn't start: " + ex.Message);
+        }
+        finally
+        {
+            Cursor = Cursors.Default;
+        }
+    }
+
+    private void UpdateMirror()
+    {
+        try
+        {
+            string? mirror = _settings.Mirror ? _settings.MirrorId ?? DeviceList.DefaultId(DataFlow.Render) : null;
+            _engine.SetMirror(mirror);
+        }
+        catch (Exception ex)
+        {
+            SendStatus("Couldn't start mirroring: " + ex.Message);
+        }
+    }
+
+    private void SelectApp(int? pid)
+    {
+        if (pid == 0) pid = null;
+        _settings.AppName = _apps.FirstOrDefault(a => a.ProcessId == pid)?.Name;
+        try
+        {
+            _engine.SetApp(pid);
+            if (_engine.IsRunning) SendStatus("Live");
+        }
+        catch (Exception ex)
+        {
+            SendStatus("Couldn't capture that app: " + ex.Message);
+        }
+    }
+
+    private void SetMixer(string key, JsonNode value)
+    {
+        switch (key)
+        {
+            case "micGain": _settings.MicGain = (int)value; break;
+            case "micVolume": _settings.MicVolume = (int)value; break;
+            case "appGain": _settings.AppGain = (int)value; break;
+            case "appVolume": _settings.AppVolume = (int)value; break;
+            case "micMuted": _settings.MicMuted = (bool)value; break;
+            case "appMuted": _settings.AppMuted = (bool)value; break;
+            case "mirror": _settings.Mirror = (bool)value; UpdateMirror(); break;
+        }
+        ApplyMixer();
+    }
+
+    private void ApplyMixer()
+    {
+        _engine.MicGain = DbToGain(_settings.MicGain);
+        _engine.MicVolume = _settings.MicVolume / 100f;
+        _engine.AppGain = DbToGain(_settings.AppGain);
+        _engine.AppVolume = _settings.AppVolume / 100f;
+        _engine.MicMuted = _settings.MicMuted;
+        _engine.AppMuted = _settings.AppMuted;
+    }
+
+    private static float DbToGain(int db) => MathF.Pow(10f, Math.Clamp(db, 0, 24) / 20f);
+
+    private void SendInit()
+    {
+        _apps = DeviceList.Apps();
+        var inputs = DeviceList.Inputs().Where(d => !IsCable(d)).ToList();
+        var outputs = DeviceList.Outputs();
+
+        _settings.MicId ??= DeviceList.DefaultId(DataFlow.Capture);
+        _settings.OutputId ??= outputs.FirstOrDefault(IsCable)?.Id;
+        _settings.MirrorId ??= DeviceList.DefaultId(DataFlow.Render);
+
+        var savedApp = _apps.FirstOrDefault(a => a.Name == _settings.AppName);
+        _engine.SetApp(savedApp?.ProcessId);
+
+        Post(new
+        {
+            type = "init",
+            version = Version,
+            theme = _settings.Theme,
+            hasCable = outputs.Any(IsCable),
+            devices = new
+            {
+                inputs = inputs.Select(d => new { id = d.Id, name = d.Name }),
+                outputs = outputs.Select(d => new { id = d.Id, name = d.Name }),
+                mirrors = outputs.Where(d => !IsCable(d)).Select(d => new { id = d.Id, name = d.Name }),
+                mic = _settings.MicId,
+                output = _settings.OutputId,
+                mirror = _settings.MirrorId,
+            },
+            apps = AppList(),
+            app = savedApp?.ProcessId ?? 0,
+            mixer = new
+            {
+                micGain = _settings.MicGain,
+                micVolume = _settings.MicVolume,
+                appGain = _settings.AppGain,
+                appVolume = _settings.AppVolume,
+                micMuted = _settings.MicMuted,
+                appMuted = _settings.AppMuted,
+                mirror = _settings.Mirror,
+            },
+            presets = VoiceSettings.Presets.Select(p => new { name = p.Name, voice = p.Settings }),
+            ai = AiVoiceList(),
+            profiles = _settings.Profiles.Select(p => new { name = p.Name, voice = p.Voice }),
+            activePreset = _settings.ActivePreset,
+            voice = _settings.Voice,
+        });
+    }
+
+    private object AppList() => _apps.Select(a => new { pid = a.ProcessId, name = a.Name, title = a.Title });
+
+    private void SendApps()
+    {
+        int? current = _apps.FirstOrDefault(a => a.Name == _settings.AppName)?.ProcessId;
+        _apps = DeviceList.Apps();
+        var match = _apps.FirstOrDefault(a => a.Name == _settings.AppName);
+        // The same app may have restarted with a new process id.
+        if (match != null && match.ProcessId != current) SelectApp(match.ProcessId);
+        Post(new { type = "apps", apps = AppList(), app = match?.ProcessId ?? 0 });
+    }
+
+    private void SendProfiles() =>
+        Post(new { type = "profiles", profiles = _settings.Profiles.Select(p => new { name = p.Name, voice = p.Voice }), activePreset = _settings.ActivePreset });
+
+    private void SendStatus(string text) => Post(new { type = "status", text, running = _engine.IsRunning });
+
+    private void Post(object message)
+    {
+        if (!_ready || _web.CoreWebView2 == null) return;
+        _web.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(message, Json));
+    }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        _settings.MicId = (_mic.SelectedItem as DeviceItem)?.Id;
-        _settings.OutputId = (_output.SelectedItem as DeviceItem)?.Id;
-        _settings.MonitorId = (_monitorDevice.SelectedItem as DeviceItem)?.Id;
-        _settings.MonitorEnabled = _monitor.Checked;
-        _settings.AppName = _app.SelectedItem is AppItem a && a != NoApp ? a.Name : null;
-        _settings.Preset = (_preset.SelectedItem as VoicePreset)?.Name ?? "Off";
-        _settings.MicVolume = _micVolume.Value;
-        _settings.AppVolume = _appVolume.Value;
         _settings.Save();
-
         _meterTimer.Stop();
         _engine.Dispose();
         base.OnFormClosing(e);
     }
 
+    private static string FormatVersion(Version? v) => v == null ? "dev" : $"{v.Major}.{v.Minor}.{v.Build:D2}";
+
+    /// <summary>Links shown on the credits list that may open in the browser.</summary>
+    private static readonly HashSet<string> CreditLinks = new()
+    {
+        "https://vb-audio.com/Cable/",
+        "https://github.com/naudio/NAudio",
+        "https://github.com/microsoft/onnxruntime",
+        "https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI",
+        "https://github.com/mrdoob/three.js",
+    };
+
     private static bool IsCable(DeviceItem d) => d.Name.Contains("CABLE", StringComparison.OrdinalIgnoreCase);
-
-    private static void Select(ComboBox box, string? id)
-    {
-        box.SelectedItem = box.Items.Cast<DeviceItem>().FirstOrDefault(d => d.Id == id);
-        if (box.SelectedIndex < 0 && box.Items.Count > 0) box.SelectedIndex = 0;
-    }
-
-    private static int Decay(int current, float peak)
-    {
-        int target = (int)(Math.Sqrt(peak) * 100);
-        return Math.Max(target, current - 6);
-    }
-
-    private static void AddRow(TableLayoutPanel grid, string label, Control main, Control? extra)
-    {
-        int row = grid.RowCount;
-        grid.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 10, 6) }, 0, row);
-        grid.Controls.Add(main, 1, row);
-        if (extra != null) grid.Controls.Add(extra, 2, row);
-        grid.RowCount++;
-    }
-
-    private static Control Stack(params Control[] controls)
-    {
-        var panel = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Padding.Empty, Anchor = AnchorStyles.Left };
-        panel.Controls.AddRange(controls);
-        return panel;
-    }
-
-    private static ComboBox Combo() => new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
-    private static TrackBar Slider() => new() { Minimum = 0, Maximum = 200, TickFrequency = 25, Dock = DockStyle.Fill, AutoSize = false, Height = 32 };
-    private static ProgressBar Meter() => new() { Width = 110, Height = 12, Anchor = AnchorStyles.Left, Maximum = 100 };
 }
